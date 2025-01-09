@@ -3,6 +3,7 @@ import pandas as pd
 import random
 import math
 import sys
+from lifelines import CoxTimeVaryingFitter
 
 # for tree visualization
 from graphviz import Digraph
@@ -26,13 +27,17 @@ def binSplitDataSet(dataSet, feature, value):
     mat1 = dataSet.loc[dataSet[feature] > value]
     return mat0, mat1
 
-# two estimators of TIR
+# estimators of TIR
 def naive_est(x, value_in_range = 'value_in_range', patient_id = 'patient_id', time = 'time'):
     TIR = (x.groupby(patient_id)[value_in_range].mean().reset_index())[value_in_range].mean()
     return TIR
 
 def proposed_est(x, value_in_range = 'value_in_range', patient_id = 'patient_id', time = 'time'):
     TIR = (x.groupby(time)[value_in_range].mean().reset_index())[value_in_range].mean()
+    return TIR
+
+def proposed_est_weight(dat, value_in_range = 'value_in_range', time = 'time', patient_id = 'patient_id'):
+    TIR = (dat.groupby(time))[[value_in_range, 'weight']].apply(lambda x: np.average(x[value_in_range], weights = x['weight'])).mean()
     return TIR
 
 
@@ -160,6 +165,35 @@ def createForest(n_trees = 10, data = np.zeros(5), candidate_vars = ['rand_group
         tree = createTreeRand(boot_sample, candidate_vars = candidate_vars, id = id, time = time, value_in_range = 'TIR_RF_value_in_range', leafType = leafType, min_samples_split= min_samples_split, min_diff_tir = min_diff_tir, depth = depth, max_depth = max_depth, max_features = max_features)
         forest.append((tree))
     return forest
+
+def createForest_cox(n_trees = 10, data = np.zeros(5), candidate_vars = ['rand_group', 'sex', 'age', 'obese'], id = 'patient_id', time = 'time', glucose = 'glucose', glucoserange = [70, 180],
+                leafType = proposed_est_weight, period = 5, formula = 'var1',
+                min_samples_split = 5, min_diff_tir = 0.001, depth = 0, max_depth = 5, max_features = 0.3):
+    forest = []
+    data['TIR_RF_value_in_range'] = data[glucose].apply(lambda x: value_in_range(x, glucoserange))
+    # prepare data for cox model
+    data['event'] = False
+    data.loc[data.groupby(id)[time].idxmax(), 'event'] = True
+    data['time2'] = data[time] + period
+    #fit cox model with time dep covariate
+    ctv = CoxTimeVaryingFitter(penalizer=0.1)
+    ctv.fit(data, id_col = id, event_col= 'event', start_col=time, stop_col='time2', formula=formula)
+    cumulative_hazard = ctv.baseline_cumulative_hazard_
+    cumulative_hazard[time] = cumulative_hazard.index
+    cumulative_hazard['hazard diff'] = cumulative_hazard['baseline hazard'].diff().fillna(cumulative_hazard['baseline hazard'])
+    data = data.reset_index(drop=True)
+    data['predict partial hazard'] = ctv.predict_partial_hazard(data).reset_index(drop=True)
+    data = data.merge(cumulative_hazard, on = time, how = 'left').fillna(value = 0)
+    data['lambda_exp_diff'] = data['hazard diff'] * data['predict partial hazard']
+    data['cum_lambda_exp_diff'] = data.groupby([id])['lambda_exp_diff'].cumsum()
+    data['weight'] = 1/(np.exp(- data['cum_lambda_exp_diff']))
+
+    for _ in range(n_trees):
+        boot_sample = bootstrap_sample(data, id = id)
+        tree = createTreeRand(boot_sample, candidate_vars = candidate_vars, id = id, time = time, value_in_range = 'TIR_RF_value_in_range', leafType = leafType, min_samples_split= min_samples_split, min_diff_tir = min_diff_tir, depth = depth, max_depth = max_depth, max_features = max_features)
+        forest.append((tree))
+    return forest
+
 
 # test if the input is a tree
 def isTree(obj):
